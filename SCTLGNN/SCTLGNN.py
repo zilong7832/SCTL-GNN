@@ -12,6 +12,7 @@ import anndata as ad
 from scipy.sparse import issparse
 from collections import Counter
 from Wrapper import ScTlGNNWrapper
+from Wrapper import build_pairs
 from Utils import Utils
 from evaluation import evaluate_prediction
 
@@ -123,12 +124,34 @@ def pipeline(args, inductive=False, verbose=2, logger=None, **kwargs):
     celltype_counts = Counter(input_train_filt.obs["celltype.l1"].tolist())
     obs_celltypes_list = input_train_filt.obs["celltype.l1"].tolist()
 
+    if args.lambda_anchor > 0:
+        print("Building train-only anchors on CPU (KNN, cosine)...")
+        with torch.no_grad():
+            Z_all = model.predict(g, idx=None, device=args.device, embedding=True)  # [N,H] on GPU
+        train_idx_np = np.asarray(split["train"], dtype=np.int64)
+        Z_train = Z_all[train_idx_np]                                              # [N_train,H]
+
+        # 在 CPU 上只对训练集构图，并映射回全局索引
+        anchor_pairs_cpu = build_pairs(
+            Z_torch=Z_train,
+            k=args.anchor_k,
+            tau=args.anchor_tau,
+            symmetrize=True,
+            index_map=train_idx_np,
+        )
+        model.anchor_pairs_tensor = anchor_pairs_cpu  # 先留 CPU；fine_tune 用时再搬
+        del Z_all, Z_train
+        torch.cuda.empty_cache()
+        print(f"Anchors built: {anchor_pairs_cpu.shape[0]} edges.")
 
     for celltype in unique_celltypes:
         print(f"\n--- Fine-tuning for cell type: {celltype} ---")
 
+        # Load the best pre-trained model state before each fine-tuning task
         model.load_model(DATASET, REPI, FOLD)
         
+        # Step 1: Calculate sample weights using the centralized function in Utils
+        # This is the single source of truth for weight calculation.
         sample_weights = Utils.loss_weights(
             obs_celltypes=obs_celltypes_list,
             target_ct=celltype,
@@ -140,18 +163,20 @@ def pipeline(args, inductive=False, verbose=2, logger=None, **kwargs):
             gamma_threshold=args.ft_gamma_threshold,
         )
         
+        # Step 2: Call the refactored fine_tune method, passing the pre-computed weights
         model.fine_tune(
             g=g,
             y=y_train,
             split=split,
             celltype=celltype,
-            sample_weights=sample_weights,
+            sample_weights=sample_weights,  # Pass the calculated weights here
             ft_epochs=args.ft_epochs,
             ft_lr=args.ft_lr,
             ft_patience=args.ft_patience,
             verbose=verbose,
             logger=logger
         )
+
 
         print(f"--- Evaluating fine-tuned model on {celltype} test cells ---")
         
@@ -198,7 +223,7 @@ if __name__ == "__main__":
     parser.add_argument("-prefix", "--prefix", default="PBMC-Li")
     parser.add_argument("-l", "--log_folder", default="logs")
     parser.add_argument("-m", "--model_folder", default="models")
-    parser.add_argument("-r", "--result_folder", default="results")
+    parser.add_argument("-r", "--result_folder", default="results-weight")
 
     parser.add_argument("-e", "--epoch", type=int, default=15000)
     parser.add_argument("-lr", "--learning_rate", type=float, default=1e-3)
@@ -237,6 +262,12 @@ if __name__ == "__main__":
     parser.add_argument("-ftb", "--ft_beta", type=float, default=-1.0)
     parser.add_argument("-ftp", "--ft_patience", type=int, default=10)
     parser.add_argument("-ftgt", "--ft_gamma_threshold", type=float, default=0.2)
+
+    parser.add_argument("--lambda_cell", type=float, default=0.3)
+
+    parser.add_argument("--lambda_anchor", type=float, default=0.3)
+    parser.add_argument("--anchor_k", type=int, default=10)
+    parser.add_argument("--anchor_tau", type=float, default=0.7)
 
     parser.add_argument("--n_splits", type=int, default=5)
 

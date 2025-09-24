@@ -10,6 +10,184 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.neighbors import NearestNeighbors
+from collections import Counter
+
+def build_pairs(
+    Z_torch: torch.Tensor,          # [N,H] 你的 cell embedding，在哪个设备都行
+    k: int = 10,
+    tau: float = 0.7,
+    symmetrize: bool = True,
+    index_map: np.ndarray | None = None,   # 本地 -> 全局 索引映射（例如 split["train"]）
+) -> torch.Tensor:
+    """
+    在 CPU 上用 KNN(余弦)构建锚点边：
+      - 只取每个样本的 top-k 邻居（避免 O(N^2)）
+      - 用 softmax(-dist/tau) 得到权重
+      - 返回 CPU tensor: [M,3] = [i_global, j_global, w_ij]
+    """
+    if Z_torch.ndim != 2 or Z_torch.size(0) <= 1:
+        return torch.empty(0, 3, dtype=torch.float32)
+
+    # 拷到 CPU float32
+    Z = Z_torch.detach().to("cpu", dtype=torch.float32).numpy()
+    # 行归一化：cosine 距离 = 1 - cos_sim
+    Z /= (np.linalg.norm(Z, axis=1, keepdims=True) + 1e-12)
+
+    n = Z.shape[0]
+    n_neighbors = min(k + 1, n)  # 包含 self，后面会去掉
+    nn = NearestNeighbors(n_neighbors=n_neighbors, metric="cosine", n_jobs=-1)
+    nn.fit(Z)
+    dists, idxs = nn.kneighbors(Z, return_distance=True)  # [N,k+1]
+
+    # 去掉 self（通常第一列）
+    idxs = idxs[:, 1:]                 # [N,k]
+    dists = dists[:, 1:]               # [N,k]
+
+    # 按行 softmax(-dist/tau) 得权重
+    S = np.exp(-dists / max(tau, 1e-12))
+    S /= (S.sum(axis=1, keepdims=True) + 1e-12)
+
+    rows = np.arange(n, dtype=np.int64)[:, None]
+    i_local = np.repeat(rows, idxs.shape[1], axis=1).reshape(-1)  # [N*k]
+    j_local = idxs.reshape(-1).astype(np.int64)                   # [N*k]
+    w_flat  = S.reshape(-1).astype(np.float32)                    # [N*k]
+
+    # 本地 -> 全局
+    if index_map is not None:
+        i_glob = index_map[i_local]
+        j_glob = index_map[j_local]
+    else:
+        i_glob = i_local
+        j_glob = j_local
+
+    if symmetrize:
+        i2 = np.concatenate([i_glob, j_glob], axis=0)
+        j2 = np.concatenate([j_glob, i_glob], axis=0)
+        w2 = np.concatenate([w_flat,  w_flat], axis=0) * 0.5
+        out = np.stack([i2, j2, w2], axis=1)
+    else:
+        out = np.stack([i_glob, j_glob, w_flat], axis=1)
+
+    return torch.from_numpy(out)  # 先留在 CPU；用 loss 时再 .to(device)
+
+def anchor_smoothing_loss(
+    y_pred: torch.Tensor,        # [N, P]
+    anchor_pairs: torch.Tensor,  # [M, 3] = [i, j, w_ij] （device 无所谓）
+    normalize: bool = True,
+    eps: float = 1e-8
+) -> torch.Tensor:
+    """ L_anchor = sum w_ij * ||y_i - y_j||^2  / sum w_ij """
+    if anchor_pairs is None or anchor_pairs.numel() == 0:
+        return y_pred.new_tensor(0.0)
+    i = anchor_pairs[:, 0].long()
+    j = anchor_pairs[:, 1].long()
+    w = anchor_pairs[:, 2].float()
+    diff = (y_pred[i] - y_pred[j]).pow(2).mean(dim=1)  # [M]
+    num = (w * diff).sum()
+    if normalize:
+        den = w.sum().clamp_min(eps)
+        return num / den
+    return num / (len(w) + eps)
+
+def filter_anchor_pairs_by_index(anchor_pairs: torch.Tensor, allowed_idx: torch.Tensor) -> torch.Tensor:
+    """可选：仅保留两端都在 allowed_idx 的边。"""
+    if anchor_pairs is None or anchor_pairs.numel() == 0:
+        return anchor_pairs
+    mask_i = torch.isin(anchor_pairs[:, 0].long(), allowed_idx.cpu())
+    mask_j = torch.isin(anchor_pairs[:, 1].long(), allowed_idx.cpu())
+    keep = mask_i & mask_j
+    return anchor_pairs[keep]
+
+def calculate_weight_map(obs_celltypes, target_ct, similarity_matrix, sample_counts, beta, input_dim, device):
+    """
+    This function contains the core logic from V1 to calculate weights based on normalized inverse risk.
+    It is called by the new function when the sample size is less than 1000.
+    It calculates weights ONLY for the cell types provided in the `obs_celltypes` list.
+    """
+    related_cts = list({ct for ct in obs_celltypes if ct != target_ct})
+    
+    if target_ct not in sample_counts or sample_counts[target_ct] == 0:
+        return {} # Return empty weights if target has no samples
+
+    n_Q = sample_counts[target_ct]
+    d = input_dim if input_dim is not None else 50
+    
+    # 1. Calculate risk for the target domain (r_Q)
+    r_Q = n_Q ** (-2 * beta / (2 * beta + d))
+
+    # 2. Calculate risk for each related source domain (r_Pj)
+    r_P = {}
+    for ct in related_cts:
+        if ct not in sample_counts or sample_counts[ct] == 0:
+            continue
+        n_P = sample_counts[ct]
+        gamma = similarity_matrix.get(target_ct, {}).get(ct, 0) # Safely get similarity score
+        
+        exponent = -2 * gamma * beta / (2 * gamma * beta + d)
+        r_pj = n_P ** exponent
+        r_P[ct] = r_pj
+    
+    # 3. Compute weights as normalized inverse-risk
+    inv_r_Q = 1.0 / r_Q
+    inv_r_P = {ct: 1.0 / r for ct, r in r_P.items()}
+    denom = inv_r_Q + sum(inv_r_P.values())
+    
+    # Create a map of cell type to its calculated weight
+    calculated_weights = {}
+    if denom > 0:
+        calculated_weights[target_ct] = inv_r_Q / denom
+        for ct in related_cts:
+            if ct in inv_r_P:
+                calculated_weights[ct] = inv_r_P[ct] / denom
+    else: # Fallback in case of issues
+        calculated_weights[target_ct] = 1.0
+        
+    return calculated_weights
+
+# New main function that implements your hypothesis
+def compute_weights(obs_celltypes, target_ct, related_cts, similarity_matrix, sample_counts, beta, input_dim, device):
+    """
+    Computes sample-wise weights based on a hypothesis about the target cell type's sample size.
+
+    - If sample size >= 1000: Use focused training. Target weight is 1, all others are 0.
+    - If sample size < 1000: Use weighted transfer learning. Calculate weights for target and related 
+      cell types using inverse-risk, all others are 0.
+    """
+    n_Q = sample_counts.get(target_ct, 0)
+    
+    weights_map = {}
+    
+    # Case 1: Sample size is large enough --> Focused Training
+    if n_Q >= 1000:
+        print(f"INFO: Target '{target_ct}' has {n_Q} samples (>= 1000). Using focused training (weight=1).")
+        weights_map[target_ct] = 1.0
+        
+    # Case 2: Sample size is small --> Weighted Transfer Learning
+    else:
+        print(f"INFO: Target '{target_ct}' has {n_Q} samples (< 1000). Using weighted transfer learning.")
+        # Define the set of cell types that will have non-zero weights
+        active_celltypes = [target_ct] + related_cts
+        
+        # Calculate weights only for this active subset using the original V1 logic
+        weights_map = calculate_weight_map(
+            obs_celltypes=active_celltypes,
+            target_ct=target_ct,
+            similarity_matrix=similarity_matrix,
+            sample_counts=sample_counts,
+            beta=beta,
+            input_dim=input_dim,
+            device=device
+        )
+
+    # Build the final full-length tensor of weights for all samples in the batch
+    final_weights = []
+    for ct in obs_celltypes:
+        # If a cell type is in our map, use its weight. Otherwise, its weight is 0.
+        final_weights.append(weights_map.get(ct, 0.0)) 
+        
+    w = torch.tensor(final_weights, dtype=torch.float32, device=device)
+    return w
 
 class ScTlGNNWrapper:
     """
@@ -210,63 +388,93 @@ class ScTlGNNWrapper:
         return self.model
     
     def fine_tune(
-            self,
-            g: dgl.DGLGraph,
-            y: torch.Tensor,
-            split: Dict[str, np.ndarray],
-            celltype: str,
-            sample_weights: torch.Tensor,
-            ft_epochs: int,
-            ft_lr: float,
-            ft_patience: int,
-            verbose: int = 2,
-            logger=None,
-            eval_interval: int = 1
-        ):
-            """
-            Fine-tunes the model on a specific cell type with sample-wise weighted MSE loss.
-            This version saves the best model based on validation loss and reloads it after training.
-            """
-            device = self.args.device
-            g = g.to(device)
-            y = y.to(device)
+        self,
+        g: dgl.DGLGraph,
+        y: torch.Tensor,
+        split: Dict[str, np.ndarray],
+        celltype: str,
+        sample_weights: torch.Tensor,
+        ft_epochs: int,
+        ft_lr: float,
+        ft_patience: int,
+        verbose: int = 2,
+        logger=None,
+        eval_interval: int = 1
+    ):
+        """
+        Fine-tunes the model using a pre-computed weight tensor.
+        The total loss is a combination of weighted MSE and an optional anchor smoothing regularizer.
+        Total Loss = weighted_MSE + lambda_anchor * L_anchor
+        """
+        device = self.args.device
+        g = g.to(device)
+        y = y.to(device)
 
-            for name, param in self.model.named_parameters():
-                if name.startswith("embed_feat") or name.startswith("embed_cell"):
-                    param.requires_grad = False
-                else:
-                    param.requires_grad = True
-                    
-            trainable_params = filter(lambda p: p.requires_grad, self.model.parameters())
-            opt = torch.optim.AdamW(trainable_params, lr=ft_lr, weight_decay=self.args.weight_decay)
+        # Freeze embedding layers for stability during fine-tuning
+        for name, param in self.model.named_parameters():
+            if name.startswith("embed_feat") or name.startswith("embed_cell"):
+                param.requires_grad = False
+            else:
+                param.requires_grad = True
 
-            best_val_loss, epochs_no_improve = float('inf'), 0
-            
-            best_ft_dict = deepcopy(self.model.state_dict())
+        trainable_params = filter(lambda p: p.requires_grad, self.model.parameters())
+        opt = torch.optim.AdamW(trainable_params, lr=ft_lr, weight_decay=self.args.weight_decay)
 
-            for epoch in range(ft_epochs):
-                self.model.train()
-                
-                out = self.model(g)
-                
-                train_indices = split["train"]
-                losses = F.mse_loss(out[train_indices], y[train_indices], reduction="none")
-                
-                w_train = sample_weights[train_indices].to(device).unsqueeze(1)
-                weighted_loss = (losses * w_train).mean()
+        best_val_loss, epochs_no_improve = float('inf'), 0
+        best_ft_dict = deepcopy(self.model.state_dict())
 
-                opt.zero_grad()
-                weighted_loss.backward()
-                if self.args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
-                opt.step()
-                
-                torch.cuda.empty_cache()
+        # --- Anchor Smoothing Loss Setup ---
+        lambda_anchor = float(getattr(self.args, "lambda_anchor", 0.0))
+        anchor_pairs_full = getattr(self, "anchor_pairs_tensor", None)
+        
+        if lambda_anchor > 0.0 and anchor_pairs_full is not None and anchor_pairs_full.numel() > 0:
+            # Anchor pairs are built only on training data, so we can use them directly.
+            # Move them to the correct device once for the fine-tuning loop.
+            anchor_pairs_train = anchor_pairs_full.to(device)
+        else:
+            anchor_pairs_train = None
 
+        train_idx = split["train"]
+        
+        # --- Fine-tuning Loop ---
+        for epoch in range(ft_epochs):
+            self.model.train()
+            out = self.model(g)  # Full forward pass, returns [N, P] predictions
+
+            # 1) Weighted MSE Loss (Primary Loss)
+            losses_per_elem = F.mse_loss(out[train_idx], y[train_idx], reduction="none") # Shape: [N_train, P]
+            w_train = sample_weights[train_idx].to(device).unsqueeze(1)                   # Shape: [N_train, 1]
+            weighted_mse = (losses_per_elem * w_train).mean()
+
+            total_loss = weighted_mse
+
+            # 2) Anchor Smoothing Loss (Regularizer)
+            loss_anchor = torch.tensor(0.0) # Default value
+            if anchor_pairs_train is not None:
+                # The loss function operates on the full output 'out' using global indices from anchor pairs
+                loss_anchor = anchor_smoothing_loss(out, anchor_pairs_train, normalize=True)
+                total_loss = total_loss + lambda_anchor * loss_anchor
+
+            opt.zero_grad()
+            total_loss.backward()
+            if self.args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
+            opt.step()
+
+            torch.cuda.empty_cache()
+
+            # --- Validation and Early Stopping ---
+            if epoch % eval_interval == 0:
                 val_loss = self.score(g, split["valid"], y[split["valid"]], device)
-                
-                if verbose and epoch % eval_interval == 0:
-                    log_msg = f"[Fine-tune: {celltype}] Epoch {epoch+1:03d}: Train Loss={weighted_loss.item():.4f}, Val Loss={val_loss:.4f}"
+
+                if verbose:
+                    log_msg = (
+                        f"[Fine-tune: {celltype}] Epoch {epoch+1:03d}: "
+                        f"Train MSE_w={weighted_mse.item():.4f}, "
+                        f"Anchor={loss_anchor.item():.4f}, "
+                        f"TotalLoss={total_loss.item():.4f} | "
+                        f"Val RMSE={val_loss:.4f}"
+                    )
                     print(log_msg)
                     if logger:
                         logger.write(log_msg + "\n")
@@ -278,17 +486,126 @@ class ScTlGNNWrapper:
                 else:
                     epochs_no_improve += 1
                     if epochs_no_improve >= ft_patience:
-                        print(f"Early stopping at epoch {epoch+1} for cell type '{celltype}'. Best val loss: {best_val_loss:.4f}")
+                        print(
+                            f"Early stopping at epoch {epoch+1} for cell type '{celltype}'. "
+                            f"Best val loss: {best_val_loss:.4f}"
+                        )
                         break
+        
+        print(f"Finished fine-tuning for {celltype}. Loading best model with val loss: {best_val_loss:.4f}")
+        self.model.load_state_dict(best_ft_dict)
+
+        # Unfreeze all parameters after fine-tuning for this cell type is complete
+        for param in self.model.parameters():
+            param.requires_grad = True
             
-            print(f"Finished fine-tuning for {celltype}. Loading best model with val loss: {best_val_loss:.4f}")
-            self.model.load_state_dict(best_ft_dict)
-            
-            for param in self.model.parameters():
-                param.requires_grad = True
-                
-            return self
-    
+        return self
+        
+    # def fine_tune(
+    #         self,
+    #         g: dgl.DGLGraph,
+    #         y: torch.Tensor,
+    #         split: Dict[str, np.ndarray],
+    #         celltype: str,
+    #         sample_weights: torch.Tensor,
+    #         ft_epochs: int,
+    #         ft_lr: float,
+    #         ft_patience: int,
+    #         verbose: int = 2,
+    #         logger=None,
+    #         eval_interval: int = 1
+    #     ):
+    #         """
+    #         Fine-tunes with weighted MSE + anchor smoothing (train-only anchors from CPU).
+    #         total_loss = weighted_MSE + lambda_anchor * L_anchor
+    #         """
+    #         device = self.args.device
+    #         g = g.to(device)
+    #         y = y.to(device)
+
+    #         # freeze as before
+    #         for name, param in self.model.named_parameters():
+    #             if name.startswith("embed_feat") or name.startswith("embed_cell"):
+    #                 param.requires_grad = False
+    #             else:
+    #                 param.requires_grad = True
+
+    #         trainable_params = filter(lambda p: p.requires_grad, self.model.parameters())
+    #         opt = torch.optim.AdamW(trainable_params, lr=ft_lr, weight_decay=self.args.weight_decay)
+
+    #         best_val_loss, epochs_no_improve = float('inf'), 0
+    #         best_ft_dict = deepcopy(self.model.state_dict())
+
+    #         lambda_anchor = float(getattr(self.args, "lambda_anchor", 0.0))
+    #         # 注意：我们已经在 pipeline 里只对 train 构过图并注入 wrapper 了
+    #         anchor_pairs_full = getattr(self, "anchor_pairs_tensor", None)
+    #         if lambda_anchor > 0.0 and anchor_pairs_full is not None and anchor_pairs_full.numel() > 0:
+    #             # 这批边本来就只含 train 节点（因为我们用 index_map=train_idx_np 构的）
+    #             anchor_pairs_train = anchor_pairs_full.to(device)
+    #         else:
+    #             anchor_pairs_train = None  # 不做 anchor 正则
+
+    #         train_idx = split["train"]
+
+    #         for epoch in range(ft_epochs):
+    #             self.model.train()
+    #             out = self.model(g)  # [N,P]
+
+    #             # 1) weighted MSE（原有）
+    #             losses_per_elem = F.mse_loss(out[train_idx], y[train_idx], reduction="none")  # [N_train,P]
+    #             w_train = sample_weights[train_idx].to(device).unsqueeze(1)                   # [N_train,1]
+    #             weighted_mse = (losses_per_elem * w_train).mean()
+
+    #             total_loss = weighted_mse
+
+    #             # 2) anchor smoothing（若启用）
+    #             if lambda_anchor > 0.0 and anchor_pairs_train is not None and anchor_pairs_train.numel() > 0:
+    #                 loss_anchor = anchor_smoothing_loss(out, anchor_pairs_train, normalize=True)
+    #                 total_loss = total_loss + lambda_anchor * loss_anchor
+    #             else:
+    #                 loss_anchor = None
+
+    #             opt.zero_grad()
+    #             total_loss.backward()
+    #             if self.args.grad_clip > 0:
+    #                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
+    #             opt.step()
+
+    #             torch.cuda.empty_cache()
+
+    #             # 验证 RMSE（不变）
+    #             val_loss = self.score(g, split["valid"], y[split["valid"]], device)
+
+    #             if verbose and epoch % eval_interval == 0:
+    #                 log_msg = f"[Fine-tune: {celltype}] Epoch {epoch+1:03d}: " \
+    #                         f"Train MSE_w={weighted_mse.item():.4f}, " \
+    #                         f"{('Anchor=' + f'{loss_anchor.item():.4f}, ') if loss_anchor is not None else ''}" \
+    #                         f"Val RMSE={val_loss:.4f}"
+    #                 print(log_msg)
+    #                 if logger:
+    #                     logger.write(log_msg + "\n")
+
+    #             # 早停（不变）
+    #             if val_loss < best_val_loss:
+    #                 best_val_loss = val_loss
+    #                 epochs_no_improve = 0
+    #                 best_ft_dict = deepcopy(self.model.state_dict())
+    #             else:
+    #                 epochs_no_improve += 1
+    #                 if epochs_no_improve >= ft_patience:
+    #                     print(f"Early stopping at epoch {epoch+1} for cell type '{celltype}'. "
+    #                         f"Best val loss: {best_val_loss:.4f}")
+    #                     break
+
+    #         print(f"Finished fine-tuning for {celltype}. Loading best model with val loss: {best_val_loss:.4f}")
+    #         self.model.load_state_dict(best_ft_dict)
+
+    #         # unfreeze
+    #         for param in self.model.parameters():
+    #             param.requires_grad = True
+    #         return self
+
+
 class ScTlGNN(nn.Module):
 
     def __init__(self, args):
