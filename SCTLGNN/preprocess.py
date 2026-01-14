@@ -1,8 +1,13 @@
+# -*- coding: utf-8 -*-
 import numpy as np
 import pandas as pd
 import anndata as ad
 import scanpy as sc
 from pathlib import Path
+
+# ========================
+# Utils
+# ========================
 
 def to_dense(X):
     """Convert matrix to dense numpy array (support sparse input)."""
@@ -12,111 +17,143 @@ def to_dense(X):
         return np.asarray(X.todense())
     return np.asarray(X)
 
-def clr_transform(mat, axis=1, pseudocount=1.0):
-    """Perform CLR (centered log-ratio) transformation."""
-    X = np.array(mat, dtype=float) + pseudocount
-    if axis == 1:  # per row (cell-wise)
-        gm = np.exp(np.mean(np.log(X), axis=1, keepdims=True))
-        return np.log(X / gm)
-    elif axis == 0:  # per column (feature-wise)
-        gm = np.exp(np.mean(np.log(X), axis=0, keepdims=True))
-        return np.log(X / gm)
+# ========================
+# RNA Processing (Normalization)
+# ========================
+
+def normalize_rna(adata: ad.AnnData) -> ad.AnnData:
+    """
+    处理 RNA：
+      - 输入应为 Raw Counts (来自 R 的 input_rna.h5ad)
+      - 若 layers["counts"] 不存在，将 X 备份进去
+      - 执行：Library Size Normalization (至中位数) + log1p
+      - 输出：
+          obsm["rna_raw"]   = 原始计数
+          layers["lognorm"] = 归一化后数据
+          X                 = 归一化后数据
+    """
+    A = adata.copy()
+
+    # 1. 确保有 counts 层 (如果 R 输出只有 X，这里备份一下)
+    if "counts" not in A.layers:
+        A.layers["counts"] = A.X.copy()
+    
+    # 2. 保存原始数据到 obsm (模型通常需要 raw 用于计算 loss)
+    A.obsm["rna_raw"] = to_dense(A.layers["counts"])
+
+    # 3. 计算 Library Size 中位数
+    if hasattr(A.X, "A1"): # sparse
+        lib = A.X.sum(axis=1).A1
     else:
-        raise ValueError("axis must be 0 or 1")
+        lib = np.asarray(A.X.sum(axis=1)).ravel()
+    
+    target_sum = float(np.median(lib))
+    print(f"  -> RNA Normalization target sum (median): {target_sum:.2f}")
 
-def extract_protein_matrix_and_names(adata: ad.AnnData):
-    """
-    Extract protein expression matrix and names.
-    Priority: obsm['protein_expression'] + uns['protein_name'].
-    Fallback: use adata.X + var_names.
-    """
-    if "protein_expression" in adata.obsm:
-        M = to_dense(adata.obsm["protein_expression"])
-        names = adata.uns.get("protein_name", None)
-        if names is None:
-            names = [f"ADT{i}" for i in range(M.shape[1])]
-        else:
-            names = list(map(str, names))
-        return M, names
-    return to_dense(adata.X), adata.var_names.astype(str).tolist()
-
-# ========================
-# Pipeline steps (unchanged)
-# ========================
-
-def cluster_rna(adata: ad.AnnData, n_pcs=50, leiden_res=0.5, cluster_key="groups"):
-    """Cluster RNA data using PCA → neighbors → Leiden."""
-    A = adata.copy()
-    if "counts" in A.layers:
-        A.X = A.layers["counts"].copy()
-    sc.pp.pca(A, n_comps=min(n_pcs, A.n_vars - 1))
-    sc.pp.neighbors(A)
-    sc.tl.leiden(A, key_added=cluster_key, resolution=leiden_res)
-    return A
-
-def normalize_rna(adata: ad.AnnData, target_sum=1e4):
-    """Normalize RNA counts using normalize_total + log1p."""
-    A = adata.copy()
-    if "counts" in A.layers:
-        A.X = A.layers["counts"].copy()
+    # 4. 归一化 + Log1p
     sc.pp.normalize_total(A, target_sum=target_sum)
     sc.pp.log1p(A)
+
+    # 5. 保存处理后的层
+    A.layers["lognorm"] = A.X.copy()
+    
     return A
 
-def normalize_protein(adata: ad.AnnData, pseudocount=1.0):
-    """Normalize protein data with CLR transform."""
-    M, prot_names = extract_protein_matrix_and_names(adata)
-    M_clr = clr_transform(M, axis=1, pseudocount=pseudocount)
-    var = pd.DataFrame(index=pd.Index(prot_names, name="protein"))
-    return ad.AnnData(X=M_clr, obs=adata.obs.copy(), var=var)
+# ========================
+# Protein Processing (Formatting)
+# ========================
+
+def format_protein(adata: ad.AnnData, source_is_clr=False) -> ad.AnnData:
+    """
+    格式化蛋白数据：
+      - R 代码输出的通常已经是 CLR 归一化后的数据 (.X)
+      - 此函数将其整理为模型需要的格式
+      - 输出：
+          X: 保持输入值 (如果是 R 的输出，就是 CLR 值)
+          layers["counts"]: 这里的命名是为了兼容模型读取，实际上存的是 R 处理后的值
+          var: index 设为 protein name
+    """
+    # R 输出的数据在 .X 中，且转置处理过了 (Cells x Proteins)
+    M = to_dense(adata.X)
+    
+    # 获取蛋白名称
+    names = adata.var_names.astype(str).tolist()
+    
+    # 构建新的 AnnData 确保干净
+    A = ad.AnnData(
+        X=M,
+        obs=adata.obs.copy(),
+        var=pd.DataFrame(index=pd.Index(names, name="protein"))
+    )
+
+    # 模型通常寻找 'raw_counts' 或 'counts' 层
+    # 注意：因为 R 已经做了 CLR，这里存的其实是 CLR 值，但为了代码兼容性保持结构
+    A.layers["raw_counts"] = A.X.copy()
+    
+    # 也可以存一份到 raw
+    A.raw = A.copy()
+    
+    if source_is_clr:
+        print("  -> Note: Input protein data seems to be CLR normalized (from R). Structure preserved.")
+        
+    return A
 
 # ========================
-# Main pipeline (MODIFIED)
+# Main pipeline (Connecting to R output)
 # ========================
 
 def run_pipeline():
-    # -------- Parameters (edit here) --------
-    input_h5ad  = Path("/mnt/scratch/zhan2210/datasets/different samples/CITE-PBMC-Li/Group2.h5ad")
-    outdir      = Path("/mnt/scratch/zhan2210/datasets/different samples/CITE-PBMC-Li/")
-    prefix      = "Group2" # A prefix for the output file names
+    # -------- Parameters (Match R Output) --------
+    # R 输出目录
+    data_dir = Path("/mnt/scratch/zhan2210/data/PBMC")
+    prefix   = "PBMC_clean" # R script 中的 PREFIX_OUTPUT
+    
+    # R 生成的具体文件名
+    rna_input_path  = data_dir / f"{prefix}_input_rna.h5ad"
+    prot_input_path = data_dir / f"{prefix}_target_protein_clr.h5ad"
+    
+    # 最终输出路径
+    outdir = data_dir
+    # ---------------------------------------------
 
-    # --- Preprocessing settings ---
-    n_pcs       = 50
-    leiden_res  = 0.5
-    target_sum  = 10000
-    pseudocount = 1.0
-    # ----------------------------------------
+    if not rna_input_path.exists():
+        raise FileNotFoundError(f"R output not found: {rna_input_path}\nPlease run the R script first.")
 
-    # Create output directory
-    outdir.mkdir(parents=True, exist_ok=True)
+    print(f"Loading RNA from R output: {rna_input_path}")
+    adata_rna = ad.read_h5ad(rna_input_path)
+    
+    print(f"Loading Protein from R output: {prot_input_path}")
+    adata_prot = ad.read_h5ad(prot_input_path)
 
-    # Load data
-    print(f"Loading data from: {input_h5ad}")
-    adata = ad.read_h5ad(input_h5ad)
-    if "counts" not in adata.layers:
-        adata.layers["counts"] = adata.X.copy() 
+    # 简单的对齐检查
+    if adata_rna.shape[0] != adata_prot.shape[0]:
+        raise ValueError("Error: Cell counts in RNA and Protein files do not match!")
 
-    # Step 1: Cluster
-    # print("Step 1: Clustering RNA...")
-    # adata_clustered = cluster_rna(adata, n_pcs=n_pcs, leiden_res=leiden_res)
+    # ===== Step 1: 处理 RNA =====
+    # R 输出的是 Raw Counts，所以这里我们需要进行 Normalize + Log1p
+    print("\nStep 1: Normalizing RNA (Median + Log1p)...")
+    processed_rna = normalize_rna(adata_rna)
 
-    # Step 2: Normalize RNA and Protein data
-    print("Step 2: Normalizing RNA & Protein...")
-    processed_rna = normalize_rna(adata, target_sum=target_sum)
-    processed_protein = normalize_protein(adata, pseudocount=pseudocount)
+    # ===== Step 2: 格式化 Protein =====
+    # R 输出的是 CLR Normalized Data，我们将其格式化以便 Python 模型读取
+    print("\nStep 2: Formatting Protein (Using CLR from R)...")
+    processed_protein = format_protein(adata_prot, source_is_clr=True)
 
-    # Step 3: Export the two processed AnnData objects
-    print(f"Step 3: Exporting results to: {outdir}")
+    # ===== Step 3: 导出最终文件 =====
     rna_out_path = outdir / f"{prefix}.processed_rna.h5ad"
     protein_out_path = outdir / f"{prefix}.processed_protein.h5ad"
 
+    print("\nStep 3: Saving processed files...")
     processed_rna.write_h5ad(rna_out_path, compression="gzip")
     processed_protein.write_h5ad(protein_out_path, compression="gzip")
-    
-    print(f"\nExported 2 files:")
-    print(f"  RNA: {rna_out_path}")
-    print(f"  Protein: {protein_out_path}")
-    print("\nPipeline finished successfully. ✨")
+
+    print("\n✅ Pipeline finished.")
+    print(f"  Processed RNA saved to:    {rna_out_path}")
+    print(f"  Processed Protein saved to:{protein_out_path}")
+    print("\nSummary:")
+    print(f"  Cells: {processed_rna.shape[0]}")
+    print(f"  Genes: {processed_rna.shape[1]}")
+    print(f"  Proteins: {processed_protein.shape[1]}")
 
 if __name__ == "__main__":
     run_pipeline()

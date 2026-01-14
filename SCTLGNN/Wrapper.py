@@ -10,184 +10,210 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.neighbors import NearestNeighbors
-from collections import Counter
 
-def build_pairs(
-    Z_torch: torch.Tensor,          # [N,H] 你的 cell embedding，在哪个设备都行
-    k: int = 10,
-    tau: float = 0.7,
-    symmetrize: bool = True,
-    index_map: np.ndarray | None = None,   # 本地 -> 全局 索引映射（例如 split["train"]）
-) -> torch.Tensor:
+import csv, time
+from pathlib import Path
+
+
+# =============================================================================
+# [新增] GASDU 管理器 (V2 内存优化版)
+# =============================================================================
+class GasduManager:
     """
-    在 CPU 上用 KNN(余弦)构建锚点边：
-      - 只取每个样本的 top-k 邻居（避免 O(N^2)）
-      - 用 softmax(-dist/tau) 得到权重
-      - 返回 CPU tensor: [M,3] = [i_global, j_global, w_ij]
-    """
-    if Z_torch.ndim != 2 or Z_torch.size(0) <= 1:
-        return torch.empty(0, 3, dtype=torch.float32)
-
-    # 拷到 CPU float32
-    Z = Z_torch.detach().to("cpu", dtype=torch.float32).numpy()
-    # 行归一化：cosine 距离 = 1 - cos_sim
-    Z /= (np.linalg.norm(Z, axis=1, keepdims=True) + 1e-12)
-
-    n = Z.shape[0]
-    n_neighbors = min(k + 1, n)  # 包含 self，后面会去掉
-    nn = NearestNeighbors(n_neighbors=n_neighbors, metric="cosine", n_jobs=-1)
-    nn.fit(Z)
-    dists, idxs = nn.kneighbors(Z, return_distance=True)  # [N,k+1]
-
-    # 去掉 self（通常第一列）
-    idxs = idxs[:, 1:]                 # [N,k]
-    dists = dists[:, 1:]               # [N,k]
-
-    # 按行 softmax(-dist/tau) 得权重
-    S = np.exp(-dists / max(tau, 1e-12))
-    S /= (S.sum(axis=1, keepdims=True) + 1e-12)
-
-    rows = np.arange(n, dtype=np.int64)[:, None]
-    i_local = np.repeat(rows, idxs.shape[1], axis=1).reshape(-1)  # [N*k]
-    j_local = idxs.reshape(-1).astype(np.int64)                   # [N*k]
-    w_flat  = S.reshape(-1).astype(np.float32)                    # [N*k]
-
-    # 本地 -> 全局
-    if index_map is not None:
-        i_glob = index_map[i_local]
-        j_glob = index_map[j_local]
-    else:
-        i_glob = i_local
-        j_glob = j_local
-
-    if symmetrize:
-        i2 = np.concatenate([i_glob, j_glob], axis=0)
-        j2 = np.concatenate([j_glob, i_glob], axis=0)
-        w2 = np.concatenate([w_flat,  w_flat], axis=0) * 0.5
-        out = np.stack([i2, j2, w2], axis=1)
-    else:
-        out = np.stack([i_glob, j_glob, w_flat], axis=1)
-
-    return torch.from_numpy(out)  # 先留在 CPU；用 loss 时再 .to(device)
-
-def anchor_smoothing_loss(
-    y_pred: torch.Tensor,        # [N, P]
-    anchor_pairs: torch.Tensor,  # [M, 3] = [i, j, w_ij] （device 无所谓）
-    normalize: bool = True,
-    eps: float = 1e-8
-) -> torch.Tensor:
-    """ L_anchor = sum w_ij * ||y_i - y_j||^2  / sum w_ij """
-    if anchor_pairs is None or anchor_pairs.numel() == 0:
-        return y_pred.new_tensor(0.0)
-    i = anchor_pairs[:, 0].long()
-    j = anchor_pairs[:, 1].long()
-    w = anchor_pairs[:, 2].float()
-    diff = (y_pred[i] - y_pred[j]).pow(2).mean(dim=1)  # [M]
-    num = (w * diff).sum()
-    if normalize:
-        den = w.sum().clamp_min(eps)
-        return num / den
-    return num / (len(w) + eps)
-
-def filter_anchor_pairs_by_index(anchor_pairs: torch.Tensor, allowed_idx: torch.Tensor) -> torch.Tensor:
-    """可选：仅保留两端都在 allowed_idx 的边。"""
-    if anchor_pairs is None or anchor_pairs.numel() == 0:
-        return anchor_pairs
-    mask_i = torch.isin(anchor_pairs[:, 0].long(), allowed_idx.cpu())
-    mask_j = torch.isin(anchor_pairs[:, 1].long(), allowed_idx.cpu())
-    keep = mask_i & mask_j
-    return anchor_pairs[keep]
-
-def calculate_weight_map(obs_celltypes, target_ct, similarity_matrix, sample_counts, beta, input_dim, device):
-    """
-    This function contains the core logic from V1 to calculate weights based on normalized inverse risk.
-    It is called by the new function when the sample size is less than 1000.
-    It calculates weights ONLY for the cell types provided in the `obs_celltypes` list.
-    """
-    related_cts = list({ct for ct in obs_celltypes if ct != target_ct})
+    Manages the GASDU (Gauss-Southwell Dynamic Update) logic.
     
-    if target_ct not in sample_counts or sample_counts[target_ct] == 0:
-        return {} # Return empty weights if target has no samples
-
-    n_Q = sample_counts[target_ct]
-    d = input_dim if input_dim is not None else 50
+    [V2 - Memory Optimized Selection]
+    This class handles the periodic refresh and reuse of the gradient mask
+    as described in Algorithm 1 of the paper.
     
-    # 1. Calculate risk for the target domain (r_Q)
-    r_Q = n_Q ** (-2 * beta / (2 * beta + d))
+    It implements a streaming *selection* to find the Top-k
+    threshold, avoiding the torch.cat() of all gradients.
+    """
+    
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        k_percent: float,
+        m_period: int,
+        device: torch.device
+    ):
+        """
+        Initializes the GASDU manager.
 
-    # 2. Calculate risk for each related source domain (r_Pj)
-    r_P = {}
-    for ct in related_cts:
-        if ct not in sample_counts or sample_counts[ct] == 0:
-            continue
-        n_P = sample_counts[ct]
-        gamma = similarity_matrix.get(target_ct, {}).get(ct, 0) # Safely get similarity score
+        Args:
+            model: The model being fine-tuned (must have .args attribute for grad_clip).
+            optimizer: The optimizer (e.g., AdamW) used for training.
+            k_percent: The percentage of parameters to update (e.g., 0.01).
+            m_period: The refresh period (in epochs/steps) for the mask.
+            device: The torch device (e.g., 'cuda').
+        """
+        self.model = model
+        self.optimizer = optimizer
+        self.k_percent = k_percent
+        self.m_period = m_period
+        self.device = device
         
-        exponent = -2 * gamma * beta / (2 * gamma * beta + d)
-        r_pj = n_P ** exponent
-        r_P[ct] = r_pj
-    
-    # 3. Compute weights as normalized inverse-risk
-    inv_r_Q = 1.0 / r_Q
-    inv_r_P = {ct: 1.0 / r for ct, r in r_P.items()}
-    denom = inv_r_Q + sum(inv_r_P.values())
-    
-    # Create a map of cell type to its calculated weight
-    calculated_weights = {}
-    if denom > 0:
-        calculated_weights[target_ct] = inv_r_Q / denom
-        for ct in related_cts:
-            if ct in inv_r_P:
-                calculated_weights[ct] = inv_r_P[ct] / denom
-    else: # Fallback in case of issues
-        calculated_weights[target_ct] = 1.0
+        # This dictionary will store the boolean mask for each parameter
+        # e.g., { 'param_name': torch.Tensor([True, False, ...]) }
+        self.mask: Dict[str, torch.Tensor] = {}
         
-    return calculated_weights
+        # Get total number of trainable parameters
+        self.total_trainable_params = self._get_total_trainable_params()
+        if self.total_trainable_params == 0:
+            raise ValueError("[GASDU] Model has no trainable parameters.")
+            
+        # k (k_count) is the absolute number of parameters to update
+        self.k_count = max(1, int(self.total_trainable_params * (self.k_percent / 100.0)))
+        
+        print(f"[GasduManager V2] Initialized. k={self.k_count} ({self.k_percent}%) | "
+              f"M_period={self.m_period} | "
+              f"Total Trainable Params={self.total_trainable_params}")
 
-# New main function that implements your hypothesis
-def compute_weights(obs_celltypes, target_ct, related_cts, similarity_matrix, sample_counts, beta, input_dim, device):
-    """
-    Computes sample-wise weights based on a hypothesis about the target cell type's sample size.
+    def _get_total_trainable_params(self) -> int:
+        """Helper to count trainable parameters."""
+        count = 0
+        for param in self.model.parameters():
+            if param.requires_grad:
+                count += param.numel()
+        return count
 
-    - If sample size >= 1000: Use focused training. Target weight is 1, all others are 0.
-    - If sample size < 1000: Use weighted transfer learning. Calculate weights for target and related 
-      cell types using inverse-risk, all others are 0.
-    """
-    n_Q = sample_counts.get(target_ct, 0)
-    
-    weights_map = {}
-    
-    # Case 1: Sample size is large enough --> Focused Training
-    if n_Q >= 1000:
-        print(f"INFO: Target '{target_ct}' has {n_Q} samples (>= 1000). Using focused training (weight=1).")
-        weights_map[target_ct] = 1.0
+    @torch.no_grad()
+    def _refresh_mask(self):
+        """
+        [V2] Refreshes the gradient mask using a memory-efficient streaming *selection*.
         
-    # Case 2: Sample size is small --> Weighted Transfer Learning
-    else:
-        print(f"INFO: Target '{target_ct}' has {n_Q} samples (< 1000). Using weighted transfer learning.")
-        # Define the set of cell types that will have non-zero weights
-        active_celltypes = [target_ct] + related_cts
+        This finds the global Top-k threshold by iterating through parameter
+        gradients one by one, using only an O(k) tensor pool, thus avoiding
+        the torch.cat() of all gradients.
         
-        # Calculate weights only for this active subset using the original V1 logic
-        weights_map = calculate_weight_map(
-            obs_celltypes=active_celltypes,
-            target_ct=target_ct,
-            similarity_matrix=similarity_matrix,
-            sample_counts=sample_counts,
-            beta=beta,
-            input_dim=input_dim,
-            device=device
-        )
+        This corresponds to Algorithm 1, lines 4-5.
+        """
+        print(f"[GASDU V2] Refreshing mask (k={self.k_count}) using streaming selection...")
+        
+        # 1. Initialize the O(k) candidate pool for Top-k values.
+        # We find the k-th largest by sorting and picking the smallest.
+        # 使用 .float() 确保类型正确
+        top_k_pool = torch.full((self.k_count,), -1.0, device=self.device, dtype=torch.float32)
+        current_threshold = -1.0
+        
+        # --- Pass 1: Find the global Top-k threshold ---
+        for name, param in self.model.named_parameters():
+            if param.grad is None or not param.requires_grad:
+                continue
+                
+            # Get flat, absolute gradients for this parameter
+            g_flat = param.grad.abs().detach().flatten()
+            
+            # Find contenders from this param that are larger than our
+            # current k-th largest value (the minimum of the pool).
+            contenders = g_flat[g_flat > current_threshold]
+            
+            if contenders.numel() > 0:
+                # Combine our current pool with the new contenders
+                # 确保 contenders 也是 float32
+                combined = torch.cat([top_k_pool, contenders.float()])
+                
+                # Sort and keep only the new k-largest
+                # This is the most expensive part of the loop
+                top_k_pool = torch.topk(combined, self.k_count, sorted=False).values
+                
+                # The new threshold is the smallest value in our k-largest pool
+                current_threshold = top_k_pool.min()
+                
+            del g_flat, contenders
 
-    # Build the final full-length tensor of weights for all samples in the batch
-    final_weights = []
-    for ct in obs_celltypes:
-        # If a cell type is in our map, use its weight. Otherwise, its weight is 0.
-        final_weights.append(weights_map.get(ct, 0.0)) 
+        # After Pass 1, `current_threshold` holds the true k-th largest gradient magnitude
+        final_threshold = current_threshold.item()
+        del top_k_pool # We only needed this to find the threshold
         
-    w = torch.tensor(final_weights, dtype=torch.float32, device=device)
-    return w
+        if final_threshold < 0:
+            print("[GASDU] Warning: Gradient threshold is negative. All gradients might be zero.")
+            final_threshold = 0.0
+
+        print(f"[GASDU V2] Pass 1 complete. Global gradient threshold={final_threshold:.2e}")
+
+        # --- Pass 2: Create the boolean masks ---
+        self.mask.clear() # Clear the old mask
+        total_masked_params = 0
+        for name, param in self.model.named_parameters():
+            if param.grad is None or not param.requires_grad:
+                continue
+            
+            # Create boolean mask based on the global threshold
+            mask = (param.grad.abs().detach() >= final_threshold)
+            self.mask[name] = mask.to(self.device) # Store the mask
+            total_masked_params += mask.sum().item()
+
+        print(f"[GASDU V2] Pass 2 complete. Mask created. "
+              f"Actual params in mask={total_masked_params} (Target k={self.k_count})")
+
+
+    @torch.no_grad()
+    def _apply_mask_to_grads(self):
+        """
+        Applies the stored mask to the model's current gradients in-place.
+        This corresponds to Algorithm 1, line 9.
+        """
+        if not self.mask:
+            print("[GASDU] Warning: Tried to apply an empty mask. Skipping.")
+            return
+
+        for name, param in self.model.named_parameters():
+            if param.grad is not None:
+                if name in self.mask:
+                    # Apply mask (element-wise multiplication)
+                    param.grad.mul_(self.mask[name])
+                else:
+                    # This param was not present during last refresh (e.g., frozen)
+                    # or had no gradient. Zero it out just in case.
+                    param.grad.zero_()
+
+    def step(self, loss: torch.Tensor, epoch: int):
+        """
+        Performs a full GASDU step: backward, mask refresh/reuse, and optimizer step.
+        This function orchestrates the logic from Algorithm 1.
+        
+        Args:
+            loss: The loss tensor for the current step.
+            epoch: The current epoch number (or step number).
+        """
+        
+        # 1. Calculate full gradients (Algorithm 1, line 4 or 9)
+        self.optimizer.zero_grad()
+        loss.backward() # This is the unavoidable gradient materialization step
+        
+        is_refresh_step = (epoch % self.m_period == 0)
+        
+        # 2. Refresh or Reuse Mask
+        if is_refresh_step:
+            # Algorithm 1, lines 4-5: Calculate and store new \Lambda_t
+            self._refresh_mask()
+        else:
+            # Algorithm 1, line 7: Reuse \Lambda_{t-1} (i.e., do nothing)
+            pass
+            
+        # 3. Apply Mask (Algorithm 1, line 9: \tilde{G}_t <- \Lambda_t \odot \nabla f(W_t))
+        if self.mask:
+            self._apply_mask_to_grads()
+        else:
+            if is_refresh_step:
+                print("[GASDU] Warning: Mask is empty after refresh. Performing full gradient step.")
+            # If mask is empty on a reuse step, something is wrong, but we proceed
+            # with a full gradient step to avoid crashing.
+            
+        # 4. Optimizer Step (Algorithm 1, line 10)
+        # We clip gradients *after* masking
+        # 假设 model 实例上有 .args 属性
+        grad_clip = getattr(self.model.args, "grad_clip", 0.0)
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
+            
+        self.optimizer.step()
+# =============================================================================
+# [新增] GASDU 管理器结束
+# =============================================================================
+
 
 class ScTlGNNWrapper:
     """
@@ -205,6 +231,13 @@ class ScTlGNNWrapper:
         self.model = ScTlGNN(args).to(args.device)
         self.qt_pred = None
         self.qt_true = None
+
+    def _save_curve(self, rows, header, out_path):
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            w.writerows(rows)
 
     # ---------- model I/O ----------
     def save_model(self, dataset, repi, fold, celltype: Optional[str] = None):
@@ -259,11 +292,12 @@ class ScTlGNNWrapper:
     def score(self, g: dgl.DGLGraph, idx: Iterable[int], labels: torch.Tensor, device: str = 'cpu') -> float:
         """Return RMSE on the given indices."""
         with torch.no_grad():
-            preds = F.relu(self.predict(g, idx, device))
+            preds = self.predict(g, idx, device)  # already includes the chosen output activation
             loss = F.mse_loss(preds, labels.to(device)).item()
         return math.sqrt(loss)
 
     # ---------- training ----------
+# ---------- training ----------
     def fit(
         self,
         g: dgl.DGLGraph,
@@ -281,6 +315,7 @@ class ScTlGNNWrapper:
     ):
         """
         Train the model with optional evaluation and early stopping.
+        [MODIFIED] Disables calibration parameters during pre-training.
         """
         if sampling:
             # If you have a sampling path implemented elsewhere
@@ -302,12 +337,30 @@ class ScTlGNNWrapper:
         if verbose > 1:
             logger.write(str(self.model) + '\n'); logger.flush()
 
-        opt = torch.optim.AdamW(self.model.parameters(),
+        # === [MODIFICATION] ===
+        # 1. Force-disable calibration during forward pass for pre-training
+        print("[Pre-train] Disabling calibration (if any) for pre-training.")
+        self.model.calibrate = False 
+        
+        # 2. Filter calibration params out of the optimizer and freeze them
+        pretrain_params = []
+        for name, param in self.model.named_parameters():
+            if name in ['calib_a', 'calib_b']:
+                param.requires_grad = False
+            else:
+                param.requires_grad = True # Make sure others are trainable
+                pretrain_params.append(param)
+        
+        opt = torch.optim.AdamW(pretrain_params, # <-- Use filtered list
                                 lr=self.args.learning_rate,
                                 weight_decay=self.args.weight_decay)
+        # === [End MODIFICATION] ===
+        
         criterion = nn.MSELoss()
 
         tr, val, te = [], [], []
+        curve_rows = [] 
+        
         best_val = float('inf')
         best_ep = -1
         best_dict = deepcopy(self.model.state_dict())
@@ -326,7 +379,8 @@ class ScTlGNNWrapper:
 
             grad_clip = getattr(self.args, "grad_clip", 0.0)
             if isinstance(grad_clip, (int, float)) and grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
+                # Note: We are optimizing pretrain_params
+                torch.nn.utils.clip_grad_norm_(pretrain_params, grad_clip)
 
             opt.step()
             torch.cuda.empty_cache()
@@ -352,6 +406,10 @@ class ScTlGNNWrapper:
                         print(f"New best validation score: {best_val:.4f}. Saving model.")
                         self.save_model(dataset, repi, fold)
                     best_dict = deepcopy(self.model.state_dict())
+                
+                curr_lr = opt.param_groups[0]['lr']
+                te_rmse = te[-1] if (eval and (y_test is not None) and len(te) > 0) else float('nan')
+                curve_rows.append([epoch, tr[-1], val[-1], te_rmse, curr_lr, int(time.time())])
 
                 if epoch > 1500 and self.args.early_stopping > 0 and min(val[-self.args.early_stopping:]) > best_val:
                     if verbose > 1:
@@ -385,226 +443,197 @@ class ScTlGNNWrapper:
             print('converged testing', best_ep * eval_interval, te[best_ep])
 
         self.model.load_state_dict(best_dict)
+        
+        if dataset is None: dataset = "NA"
+        if repi is None: repi = -1
+        if fold is None: fold = -1
+        curve_path = f"{self.args.log_folder}/{self.args.prefix}_{dataset}_run{repi}_{fold}_fit_curve.csv"
+        self._save_curve(
+            curve_rows,
+            header=["epoch","train_rmse","val_rmse","test_rmse","lr","ts"],
+            out_path=curve_path
+        )
+        
+        # === [MODIFICATION] ===
+        # Restore grad and calibrate state so fine-tuning can use them
+        print("[Pre-train] Re-enabling calibration param grads for fine-tuning.")
+        for name, param in self.model.named_parameters():
+            if name in ['calib_a', 'calib_b']:
+                param.requires_grad = True
+        self.model.calibrate = self.args.calibrate # Restore to user's setting
+        # === [End MODIFICATION] ===
+        
         return self.model
     
     def fine_tune(
-        self,
-        g: dgl.DGLGraph,
-        y: torch.Tensor,
-        split: Dict[str, np.ndarray],
-        celltype: str,
-        sample_weights: torch.Tensor,
-        ft_epochs: int,
-        ft_lr: float,
-        ft_patience: int,
-        verbose: int = 2,
-        logger=None,
-        eval_interval: int = 1
-    ):
-        """
-        Fine-tunes the model using a pre-computed weight tensor.
-        The total loss is a combination of weighted MSE and an optional anchor smoothing regularizer.
-        Total Loss = weighted_MSE + lambda_anchor * L_anchor
-        """
-        device = self.args.device
-        g = g.to(device)
-        y = y.to(device)
-
-        # Freeze embedding layers for stability during fine-tuning
-        for name, param in self.model.named_parameters():
-            if name.startswith("embed_feat") or name.startswith("embed_cell"):
-                param.requires_grad = False
-            else:
-                param.requires_grad = True
-
-        trainable_params = filter(lambda p: p.requires_grad, self.model.parameters())
-        opt = torch.optim.AdamW(trainable_params, lr=ft_lr, weight_decay=self.args.weight_decay)
-
-        best_val_loss, epochs_no_improve = float('inf'), 0
-        best_ft_dict = deepcopy(self.model.state_dict())
-
-        # --- Anchor Smoothing Loss Setup ---
-        lambda_anchor = float(getattr(self.args, "lambda_anchor", 0.0))
-        anchor_pairs_full = getattr(self, "anchor_pairs_tensor", None)
-        
-        if lambda_anchor > 0.0 and anchor_pairs_full is not None and anchor_pairs_full.numel() > 0:
-            # Anchor pairs are built only on training data, so we can use them directly.
-            # Move them to the correct device once for the fine-tuning loop.
-            anchor_pairs_train = anchor_pairs_full.to(device)
-        else:
-            anchor_pairs_train = None
-
-        train_idx = split["train"]
-        
-        # --- Fine-tuning Loop ---
-        for epoch in range(ft_epochs):
-            self.model.train()
-            out = self.model(g)  # Full forward pass, returns [N, P] predictions
-
-            # 1) Weighted MSE Loss (Primary Loss)
-            losses_per_elem = F.mse_loss(out[train_idx], y[train_idx], reduction="none") # Shape: [N_train, P]
-            w_train = sample_weights[train_idx].to(device).unsqueeze(1)                   # Shape: [N_train, 1]
-            weighted_mse = (losses_per_elem * w_train).mean()
-
-            total_loss = weighted_mse
-
-            # 2) Anchor Smoothing Loss (Regularizer)
-            loss_anchor = torch.tensor(0.0) # Default value
-            if anchor_pairs_train is not None:
-                # The loss function operates on the full output 'out' using global indices from anchor pairs
-                loss_anchor = anchor_smoothing_loss(out, anchor_pairs_train, normalize=True)
-                total_loss = total_loss + lambda_anchor * loss_anchor
-
-            opt.zero_grad()
-            total_loss.backward()
-            if self.args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
-            opt.step()
-
-            torch.cuda.empty_cache()
-
-            # --- Validation and Early Stopping ---
-            if epoch % eval_interval == 0:
-                val_loss = self.score(g, split["valid"], y[split["valid"]], device)
-
-                if verbose:
-                    log_msg = (
-                        f"[Fine-tune: {celltype}] Epoch {epoch+1:03d}: "
-                        f"Train MSE_w={weighted_mse.item():.4f}, "
-                        f"Anchor={loss_anchor.item():.4f}, "
-                        f"TotalLoss={total_loss.item():.4f} | "
-                        f"Val RMSE={val_loss:.4f}"
-                    )
-                    print(log_msg)
-                    if logger:
-                        logger.write(log_msg + "\n")
-
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    epochs_no_improve = 0
-                    best_ft_dict = deepcopy(self.model.state_dict())
-                else:
-                    epochs_no_improve += 1
-                    if epochs_no_improve >= ft_patience:
-                        print(
-                            f"Early stopping at epoch {epoch+1} for cell type '{celltype}'. "
-                            f"Best val loss: {best_val_loss:.4f}"
-                        )
-                        break
-        
-        print(f"Finished fine-tuning for {celltype}. Loading best model with val loss: {best_val_loss:.4f}")
-        self.model.load_state_dict(best_ft_dict)
-
-        # Unfreeze all parameters after fine-tuning for this cell type is complete
-        for param in self.model.parameters():
-            param.requires_grad = True
+            self,
+            g: dgl.DGLGraph,
+            y: torch.Tensor,
+            split: Dict[str, np.ndarray],
+            celltype: str,
+            sample_weights: torch.Tensor,
+            ft_epochs: int,
+            ft_lr: float,
+            ft_patience: int,
+            verbose: int = 2,
+            logger=None,
+            eval_interval: int = 1,
+            dataset: str = "NA",
+            repi: int = -1,
+            fold: int = -1,
+            # [新增] 接收来自 pipeline 的 GASDU 参数
+            k_percent: float = 100.0,
+            m_period: int = 50
+        ):
+            """
+            Fine-tunes the model using a pre-computed weight tensor for weighted MSE loss.
+            [MODIFIED] Integrates GasduManager for optimization.
+            [MODIFIED] Resets and enables calibration parameters at the start.
+            """
+            device = self.args.device
+            g = g.to(device)
+            y = y.to(device)
             
-        return self
-        
-    # def fine_tune(
-    #         self,
-    #         g: dgl.DGLGraph,
-    #         y: torch.Tensor,
-    #         split: Dict[str, np.ndarray],
-    #         celltype: str,
-    #         sample_weights: torch.Tensor,
-    #         ft_epochs: int,
-    #         ft_lr: float,
-    #         ft_patience: int,
-    #         verbose: int = 2,
-    #         logger=None,
-    #         eval_interval: int = 1
-    #     ):
-    #         """
-    #         Fine-tunes with weighted MSE + anchor smoothing (train-only anchors from CPU).
-    #         total_loss = weighted_MSE + lambda_anchor * L_anchor
-    #         """
-    #         device = self.args.device
-    #         g = g.to(device)
-    #         y = y.to(device)
+            # === [MODIFICATION] ===
+            # Handle calibration logic at the START of fine-tuning for this celltype
+            if self.args.calibrate:
+                print(f"[Fine-tune: {celltype}] Enabling calibration and resetting parameters (a=1, b=0).")
+                self.model.calibrate = True
+                # Call the new reset method on the model
+                self.model.reset_calibration_parameters() 
+            else:
+                self.model.calibrate = False
+                print(f"[Fine-tune: {celltype}] Calibration is disabled.")
+            # === [End MODIFICATION] ===
+            
+            if self.args.ft_freeze_embeddings:
+                print("Freezing embedding layers for fine-tuning.") 
+                for name, param in self.model.named_parameters():
+                    # Freeze embeddings
+                    if name.startswith("embed_feat") or name.startswith("embed_cell"):
+                        param.requires_grad = False
+                    else:
+                        # Ensure all other params (including calib_a, calib_b) are trainable
+                        param.requires_grad = True
+                trainable_params = filter(lambda p: p.requires_grad, self.model.parameters())
+            else:
+                print("Training all layers (including embeddings) during fine-tuning.")
+                for _, param in self.model.named_parameters():
+                    param.requires_grad = True
+                trainable_params = self.model.parameters()
+                
+            # [修改] 将 trainable_params 转换为 list，以便 AdamW 正常接收
+            # This list() conversion correctly includes calib_a and calib_b
+            opt = torch.optim.AdamW(list(trainable_params), lr=ft_lr, weight_decay=self.args.weight_decay)
+                
+            best_val_loss, epochs_no_improve = float('inf'), 0
+            best_ft_dict = deepcopy(self.model.state_dict())
+            
+            curve_rows = []
+            
+            train_idx = split["train"]
+            
+            # === [新增] Initialize GasduManager ===
+            # 只有当 k_percent < 100% 时才启用 GASDU
+            use_gasdu = (k_percent < 100.0 and k_percent > 0.0)
 
-    #         # freeze as before
-    #         for name, param in self.model.named_parameters():
-    #             if name.startswith("embed_feat") or name.startswith("embed_cell"):
-    #                 param.requires_grad = False
-    #             else:
-    #                 param.requires_grad = True
+            gasdu_manager = None
+            if use_gasdu:
+                try:
+                    gasdu_manager = GasduManager(
+                        model=self.model,
+                        optimizer=opt,
+                        k_percent=k_percent,
+                        m_period=m_period,
+                        device=device
+                    )
+                except ValueError as e:
+                    print(f"[GASDU] Error initializing manager: {e}. Falling back to full fine-tune.")
+                    use_gasdu = False
+            else:
+                print("[GASDU] k_percent=100. Running standard full fine-tuning.")
+            # === [新增] End ===
+            
+            # --- Fine-tuning Loop ---
+            for epoch in range(ft_epochs):
+                self.model.train()
+                out = self.model(g)
 
-    #         trainable_params = filter(lambda p: p.requires_grad, self.model.parameters())
-    #         opt = torch.optim.AdamW(trainable_params, lr=ft_lr, weight_decay=self.args.weight_decay)
+                # Loss calculation (unchanged)
+                losses_per_elem = F.mse_loss(out[train_idx], y[train_idx], reduction="none")
+                w_train = sample_weights.to(device).unsqueeze(1)
+                loss = (losses_per_elem * w_train).mean()
 
-    #         best_val_loss, epochs_no_improve = float('inf'), 0
-    #         best_ft_dict = deepcopy(self.model.state_dict())
+                # === [修改] Use GasduManager or standard optim step ===
+                if gasdu_manager:
+                    # GasduManager handles:
+                    # 1. optimizer.zero_grad()
+                    # 2. loss.backward()
+                    # 3. Mask Refresh (if epoch % M == 0)
+                    # 4. Mask Apply
+                    # 5. grad_clip (via self.model.args)
+                    # 6. optimizer.step()
+                    gasdu_manager.step(loss, epoch)
+                else:
+                    # Original full fine-tune logic
+                    opt.zero_grad()
+                    loss.backward()
+                    if self.args.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
+                    opt.step()
+                # === [修改] End ===
 
-    #         lambda_anchor = float(getattr(self.args, "lambda_anchor", 0.0))
-    #         # 注意：我们已经在 pipeline 里只对 train 构过图并注入 wrapper 了
-    #         anchor_pairs_full = getattr(self, "anchor_pairs_tensor", None)
-    #         if lambda_anchor > 0.0 and anchor_pairs_full is not None and anchor_pairs_full.numel() > 0:
-    #             # 这批边本来就只含 train 节点（因为我们用 index_map=train_idx_np 构的）
-    #             anchor_pairs_train = anchor_pairs_full.to(device)
-    #         else:
-    #             anchor_pairs_train = None  # 不做 anchor 正则
+                torch.cuda.empty_cache()
 
-    #         train_idx = split["train"]
+                # --- Validation and Early Stopping ---
+                if epoch % eval_interval == 0:
+                    val_loss = self.score(g, split["valid"], y[split["valid"]], device)
 
-    #         for epoch in range(ft_epochs):
-    #             self.model.train()
-    #             out = self.model(g)  # [N,P]
+                    if verbose:
+                        # Simplified logging message
+                        log_msg = (
+                            f"[Fine-tune: {celltype}] Epoch {epoch+1:03d}: "
+                            f"Train Loss (MSE_w)={loss.item():.4f} | "
+                            f"Val RMSE={val_loss:.4f}"
+                        )
+                        print(log_msg)
+                        if logger:
+                            logger.write(log_msg + "\n")
 
-    #             # 1) weighted MSE（原有）
-    #             losses_per_elem = F.mse_loss(out[train_idx], y[train_idx], reduction="none")  # [N_train,P]
-    #             w_train = sample_weights[train_idx].to(device).unsqueeze(1)                   # [N_train,1]
-    #             weighted_mse = (losses_per_elem * w_train).mean()
-
-    #             total_loss = weighted_mse
-
-    #             # 2) anchor smoothing（若启用）
-    #             if lambda_anchor > 0.0 and anchor_pairs_train is not None and anchor_pairs_train.numel() > 0:
-    #                 loss_anchor = anchor_smoothing_loss(out, anchor_pairs_train, normalize=True)
-    #                 total_loss = total_loss + lambda_anchor * loss_anchor
-    #             else:
-    #                 loss_anchor = None
-
-    #             opt.zero_grad()
-    #             total_loss.backward()
-    #             if self.args.grad_clip > 0:
-    #                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
-    #             opt.step()
-
-    #             torch.cuda.empty_cache()
-
-    #             # 验证 RMSE（不变）
-    #             val_loss = self.score(g, split["valid"], y[split["valid"]], device)
-
-    #             if verbose and epoch % eval_interval == 0:
-    #                 log_msg = f"[Fine-tune: {celltype}] Epoch {epoch+1:03d}: " \
-    #                         f"Train MSE_w={weighted_mse.item():.4f}, " \
-    #                         f"{('Anchor=' + f'{loss_anchor.item():.4f}, ') if loss_anchor is not None else ''}" \
-    #                         f"Val RMSE={val_loss:.4f}"
-    #                 print(log_msg)
-    #                 if logger:
-    #                     logger.write(log_msg + "\n")
-
-    #             # 早停（不变）
-    #             if val_loss < best_val_loss:
-    #                 best_val_loss = val_loss
-    #                 epochs_no_improve = 0
-    #                 best_ft_dict = deepcopy(self.model.state_dict())
-    #             else:
-    #                 epochs_no_improve += 1
-    #                 if epochs_no_improve >= ft_patience:
-    #                     print(f"Early stopping at epoch {epoch+1} for cell type '{celltype}'. "
-    #                         f"Best val loss: {best_val_loss:.4f}")
-    #                     break
-
-    #         print(f"Finished fine-tuning for {celltype}. Loading best model with val loss: {best_val_loss:.4f}")
-    #         self.model.load_state_dict(best_ft_dict)
-
-    #         # unfreeze
-    #         for param in self.model.parameters():
-    #             param.requires_grad = True
-    #         return self
-
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        epochs_no_improve = 0
+                        best_ft_dict = deepcopy(self.model.state_dict())
+                    else:
+                        epochs_no_improve += 1
+                        if epochs_no_improve >= ft_patience:
+                            print(
+                                f"Early stopping at epoch {epoch+1} for cell type '{celltype}'. "
+                                f"Best val loss: {best_val_loss:.4f}"
+                            )
+                            break
+                            
+                    curr_lr = opt.param_groups[0]['lr']
+                    curve_rows.append([epoch, float(loss.item()), float(val_loss), curr_lr, int(time.time())])
+            
+            print(f"Finished fine-tuning for {celltype}. Loading best model with val loss: {best_val_loss:.4f}")
+            self.model.load_state_dict(best_ft_dict)
+            
+            # [修复] 确保 safe_celltype 用于日志文件名
+            safe_celltype_name = str(celltype).replace("/", "_").replace(" ", "")
+            curve_path = f"{self.args.log_folder}/{self.args.prefix}_{dataset}_run{repi}_{fold}_{safe_celltype_name}_finetune_curve.csv"
+            self._save_curve(
+                curve_rows,
+                header=["epoch","train_weighted_mse","val_rmse","lr","ts"],
+                out_path=curve_path
+            )
+                
+            # Unfreeze all parameters after fine-tuning for this cell type is complete
+            # This is important in case ft_freeze_embeddings was True
+            for param in self.model.parameters():
+                param.requires_grad = True
+                
+            return self
 
 class ScTlGNN(nn.Module):
 
@@ -623,9 +652,8 @@ class ScTlGNN(nn.Module):
 
         # Cell embedding
         if args.cell_init == 'none':
-            self.embed_cell = nn.Embedding(args.CELL_SIZE, hid_feats)
+            self.embed_cell = nn.Embedding(2, hid_feats)
         else:
-            # e.g., SVD-100 used as cell features
             self.embed_cell = nn.Linear(100, hid_feats)
 
         # Feature (gene) embedding
@@ -742,9 +770,18 @@ class ScTlGNN(nn.Module):
         self.wt = nn.Parameter(torch.zeros(args.conv_layers))
         
         # Post-readout linear calibration per-protein: y' = a*y + b
-        self.calibrate = getattr(args, "calibrate", True)
+        self.calibrate = getattr(self.args, "calibrate", False)
         self.calib_a = nn.Parameter(torch.ones(out_feats))
         self.calib_b = nn.Parameter(torch.zeros(out_feats))
+
+    @torch.no_grad()
+    def reset_calibration_parameters(self):
+        """Resets calibration parameters to their initial state (a=1, b=0)."""
+        print("[ScTlGNN] Resetting calibration parameters (a=1, b=0).")
+        if hasattr(self, 'calib_a') and self.calib_a is not None:
+            self.calib_a.fill_(1.0)
+        if hasattr(self, 'calib_b') and self.calib_b is not None:
+            self.calib_b.fill_(0.0) 
 
     # ----- one conv layer -----
     def conv(self, graph, layer, h, hist):
@@ -779,15 +816,13 @@ class ScTlGNN(nn.Module):
     def calculate_initial_embedding(self, graph):
         args = self.args
 
-        feat_ids = graph.nodes['feature'].data['id'].long().view(-1) 
-        cell_ids = graph.nodes['cell'].data['id'].long().view(-1)
+        input1 = F.leaky_relu(self.embed_feat(graph.srcdata['id']['feature']))
+        input2 = F.leaky_relu(self.embed_cell(graph.srcdata['id']['cell'].long()))
 
-        input1 = F.leaky_relu(self.embed_feat(feat_ids))
-        input2 = F.leaky_relu(self.embed_cell(cell_ids))
-        
         if not args.no_batch_features:
-            batch_features = graph.nodes['cell'].data['bf'].to(input2.device).float()
-            input2 += F.leaky_relu(F.dropout(self.extra_encoder(batch_features), p=0.2, training=self.training))
+            batch_features = graph.srcdata['bf']['cell']
+            input2 += F.leaky_relu(F.dropout(self.extra_encoder(batch_features), p=0.2,
+                                             training=self.training))[:input2.shape[0]]
 
         hfeat = input1
         hcell = input2
@@ -882,12 +917,18 @@ class ScTlGNN(nn.Module):
             h = F.dropout(self.readout_acts[i](h), p=args.model_dropout, training=self.training)
         h = self.readout_linears[-1](h)
 
-        # Optional linear calibration per output protein
-        if self.calibrate:
+        # Unified output activation (training & evaluation share this)
+        act_choice = getattr(self.args, "output_relu", "none")
+        if act_choice == "relu":
+            h = F.relu(h)
+        elif act_choice == "leaky_relu":
+            h = F.leaky_relu(h)
+        elif act_choice == "softplus":
+            h = F.softplus(h)
+        # else: "none" — no activation
+
+        # Optional per-protein linear calibration (default OFF)
+        if getattr(self, "calibrate", False):
             h = h * self.calib_a.unsqueeze(0) + self.calib_b.unsqueeze(0)
 
-        if args.output_relu == 'relu':
-            return F.relu(h)
-        elif args.output_relu == 'leaky_relu':
-            return F.leaky_relu(h)
         return h

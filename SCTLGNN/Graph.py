@@ -107,7 +107,7 @@ class SCTLGNNGraph(BaseTransform):
         # Initialize cell node features
         if self.cell_init == 'none':
             # DGL requires features to have a second dimension
-            cell_node_features = torch.ones(cell_size, 1).float()
+            cell_node_features = torch.ones(cell_size).long()
         elif self.cell_init == 'svd':
             self.logger.info("Initializing cell features with SVD.")
             embedder_mod1 = TruncatedSVD(n_components=100)
